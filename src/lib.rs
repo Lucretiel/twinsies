@@ -164,7 +164,7 @@ impl<T> Joint<T> {
                 ) {
                     Ok(_) => {
                         break Some(JointLock {
-                            container: self.container,
+                            container: self.container(),
                             lifetime: PhantomData,
                         })
                     }
@@ -179,7 +179,7 @@ impl<T> Joint<T> {
                 // existence)
                 4 => {
                     break Some(JointLock {
-                        container: self.container,
+                        container: self.container(),
                         lifetime: PhantomData,
                     })
                 }
@@ -331,7 +331,7 @@ impl<T> Drop for Joint<T> {
 
 #[repr(transparent)]
 pub struct JointLock<'a, T> {
-    container: NonNull<JointContainer<T>>,
+    container: &'a JointContainer<T>,
     lifetime: PhantomData<&'a mut Joint<T>>,
 }
 
@@ -343,14 +343,6 @@ pub struct JointLock<'a, T> {
 unsafe impl<T: Send + Sync> Send for JointLock<'_, T> {}
 unsafe impl<T: Send + Sync> Sync for JointLock<'_, T> {}
 
-impl<T> JointLock<'_, T> {
-    #[inline]
-    #[must_use]
-    fn container(&self) -> &JointContainer<T> {
-        unsafe { self.container.as_ref() }
-    }
-}
-
 impl<T> Deref for JointLock<'_, T> {
     type Target = T;
 
@@ -359,7 +351,7 @@ impl<T> Deref for JointLock<'_, T> {
     fn deref(&self) -> &Self::Target {
         // Safety: if a JointLock exists, it's guaranteed that the value will
         // be alive for at least the duration of the lock
-        unsafe { self.container().get_value() }
+        unsafe { self.container.get_value() }
     }
 }
 
@@ -371,7 +363,7 @@ impl<T: Debug> Debug for JointLock<'_, T> {
 
 impl<T> Drop for JointLock<'_, T> {
     fn drop(&mut self) {
-        let count = &self.container().count;
+        let count = &self.container.count;
 
         // The logic here can be a little simpler than Joint, because we're
         // guaranteed that there's at least one other handle in existence (our
@@ -395,7 +387,7 @@ impl<T> Drop for JointLock<'_, T> {
             // means we've taken responsibility for attempting to drop (and that
             // future attempts to lock will now fail)
             2 => {
-                unsafe { self.container().drop_value_in_place() }
+                unsafe { self.container.drop_value_in_place() }
 
                 // Now that the drop is finished, we can store a 0, so that our
                 // parent Joint knows to drop the container itself. There's no
