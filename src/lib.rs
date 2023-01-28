@@ -11,9 +11,9 @@ as the [`JointLock`] is alive. If the a [`Joint`] is dropped while its partner
 is locked, the object stays alive, but it dropped immediately as soon as the
 other [`Joint`] is no longer locked.
 
-Twinsies is intended to be used for things like channels, join handles, and
-async [`Waker`]- cases where some piece of shared state should only be
-preserved as long as *both* halves are still interested in it.
+Twinsies is intended to be used for things like unbuffered channels, join
+handles, and async [`Waker`]- cases where some piece of shared state should
+only be preserved as long as *both* halves are still interested in it.
 
 # Example
 
@@ -107,9 +107,9 @@ struct JointContainer<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 
     // *In general*, this counts the number of existing handles (joints +
-    // locks). The exception to this rule is that, when a drop reduces the
-    // count to 1, that drops the value, then *immediately* attempts to
-    // decremement the count down to 0. Summary of states:
+    // locks). The exception to this rule is that, when a drop reduces the count
+    // to 1, that drops the value, then *immediately* attempts to decrement the
+    // count down to 0. Summary of states:
     //
     // - 0: When we observe a 0, it means that this is the last Joint in
     //   existence and that the value was previously dropped. New lock attempts
@@ -153,6 +153,10 @@ impl<T> JointContainer<T> {
     }
 }
 
+/// A thread-safe shared ownership type that shares ownership with a partner, such
+/// that the shared object is dropped when *either* [`Joint`] goes out of scope.
+///
+/// See [module docs][crate] for details.
 pub struct Joint<T> {
     container: NonNull<JointContainer<T>>,
     phantom: PhantomData<JointContainer<T>>,
@@ -175,7 +179,7 @@ impl<T> Joint<T> {
 
     /// Create a new pair of `Joint`s, which share ownership of a value. When
     /// *either* of these joints is dropped, the shared value will be dropped
-    /// immediately. See the [module docs][]
+    /// immediately.
     #[must_use]
     #[inline]
     pub fn new(value: T) -> (Self, Self) {
@@ -199,8 +203,9 @@ impl<T> Joint<T> {
     }
 
     /// Attempt to get a reference to the stored value. This only succeeds if
-    /// both joints still exist. The value is guaranteed to exist as long as the
-    /// lock exists, even if the other `Joint` is dropped.
+    /// both joints still exist, or if this joint is already locked. The shared
+    /// value is guaranteed to exist as long as the lock exists, even if the
+    /// other joint is dropped.
     #[must_use]
     pub fn lock(&self) -> Option<JointLock<'_, T>> {
         let count = &self.container().count;
@@ -255,8 +260,8 @@ impl<T> Joint<T> {
     /// locked.
     ///
     /// Note that another thread can cause this to become false at any time.
-    /// However, once this returns false, it will never return true for this
-    /// specific [`Joint`] instance.
+    /// However, once this returns false, it will never again return true for
+    /// this specific [`Joint`] instance.
     #[inline]
     #[must_use]
     pub fn alive(&self) -> bool {
@@ -273,6 +278,12 @@ impl<T: Debug> Debug for Joint<T> {
             // We're not really worried about that case.
             _ => write!(f, "Joint(<paired>)"),
         }
+    }
+}
+
+impl<T> fmt::Pointer for Joint<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&self.container, f)
     }
 }
 
@@ -386,6 +397,16 @@ impl<T> Drop for Joint<T> {
     }
 }
 
+impl<T> Unpin for Joint<T> {}
+
+/// A lock associated with a [`Joint`], providing shared access to the
+/// underlying value.
+///
+/// This object provides [`Deref`] access to the underlying shared object. It
+/// guarantees that the shared object stays alive for at least as long as the
+/// lock itself does, even if the other [`Joint`] is dropped.
+///
+/// See [module docs][crate] for details.
 pub struct JointLock<'a, T> {
     container: &'a JointContainer<T>,
 }
@@ -393,6 +414,8 @@ pub struct JointLock<'a, T> {
 impl<T> JointLock<'_, T> {
     // It's convenient for various reasons to store a reference in the
     // `JointLock` itself and only get a raw pointer if we really need one.
+    #[inline]
+    #[must_use]
     fn pointer_to_container(&self) -> NonNull<JointContainer<T>> {
         NonNull::from(self.container)
     }
@@ -419,8 +442,16 @@ impl<T> Deref for JointLock<'_, T> {
 }
 
 impl<T: Debug> Debug for JointLock<'_, T> {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Debug::fmt(&**self, f)
+    }
+}
+
+impl<T> fmt::Pointer for JointLock<'_, T> {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&self.pointer_to_container(), f)
     }
 }
 
@@ -443,6 +474,7 @@ impl<T> Clone for JointLock<'_, T> {
         }
     }
 
+    #[inline]
     fn clone_from(&mut self, source: &Self) {
         if self.pointer_to_container() != source.pointer_to_container() {
             *self = source.clone()
@@ -494,3 +526,5 @@ impl<T> Drop for JointLock<'_, T> {
         }
     }
 }
+
+impl<T> Unpin for JointLock<'_, T> {}

@@ -1,7 +1,13 @@
 [package]
 name = "twinsies"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+authors = ["Nathan West <Lucretiel@gmail.com>"]
+
+readme = "../README.md"
+license = "MPL-2.0"
+description = "Smart pointer providing 2-way joint ownership of an object"
+repository = "https://github.com/Lucretiel/twinsies"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
