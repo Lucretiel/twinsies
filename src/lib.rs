@@ -1,31 +1,100 @@
-#![no_std]
+/*!
+Twinsies is a special shared pointer, similar to an [`Arc`], where two specific
+objects (called [`Joint`]) share joint ownership of the underlying object. The
+key difference compared to an [`Arc`] is that the underlying object is dropped
+when *either* of the [`Joint`] objects go out of scope.
+
+Because a single [`Joint`] cannot, by itself, keep the shared object alive, it
+cannot be dereferenced directly like an [`Arc`]. Instead, it must be locked
+with [`.lock()`]. While locked, the object is guaranteed to stay alive as long
+as the [`JointLock`] is alive. If the a [`Joint`] is dropped while its partner
+is locked, the object stays alive, but it dropped immediately as soon as the
+other [`Joint`] is no longer locked.
+
+Twinsies is intended to be used for things like channels, join handles, and
+async [`Waker`]- cases where some piece of shared state should only be
+preserved as long as *both* halves are still interested in it.
+
+# Example
+
+```rust
+use twinsies::Joint;
+use std::cell::Cell;
+
+let (first, second) = Joint::new(Cell::new(0));
+
+assert_eq!(first.lock().unwrap().get(), 0);
+
+first.lock().unwrap().set(10);
+assert_eq!(second.lock().unwrap().get(), 10);
+
+drop(second);
+
+// Once `second` is dropped, the shared value is gone
+assert!(first.lock().is_none())
+```
+
+# Locks preserve liveness
+```
+use twinsies::Joint;
+use std::cell::Cell;
+
+let (first, second) = Joint::new(Cell::new(0));
+
+let lock = first.lock().unwrap();
+
+lock.set(10);
+
+assert_eq!(second.lock().unwrap().get(), 10);
+second.lock().unwrap().set(20);
+
+assert_eq!(lock.get(), 20);
+
+drop(second);
+
+assert_eq!(lock.get(), 20);
+lock.set(30);
+assert_eq!(lock.get(), 30);
+
+// As soon as the lock is dropped, the shared value is gone, since `second`
+// was dropped earlier
+drop(lock);
+assert!(first.lock().is_none());
+```
+
+[`Arc`]: std::sync::Arc
+[`Weak`]: std::sync::Weak
+[`Waker`]: std::task::Waker
+[`.lock()`]: Joint::lock
+*/
 
 extern crate alloc;
 
-use core::{
+use std::{
     cell::UnsafeCell,
     fmt::{self, Debug, Formatter},
     hint::unreachable_unchecked,
     marker::PhantomData,
     mem::MaybeUninit,
     ops::Deref,
+    process::abort,
     ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use alloc::boxed::Box;
 
-/// Identical to `unreachable!`, but only in debug mode. In release mode this
-/// will be unreachable_unchecked. It therefore requires unsafe to use. Be
-/// extra careful about invariants!
+/// Identical to `unreachable`, but panics in debug mode. Still requires unsafe.
 macro_rules! debug_unreachable {
     ($($arg:tt)*) => {
         match cfg!(debug_assertions) {
             true => unreachable!($($arg)*),
-            false => unreachable_unchecked()
+            false => unreachable_unchecked(),
         }
     }
 }
+
+const MAX_COUNT: u32 = i32::MAX as u32;
 
 struct JointContainer<T> {
     // It's not clear to me if we actually need an `UnsafeCell` here, but better
@@ -38,10 +107,9 @@ struct JointContainer<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 
     // *In general*, this counts the number of existing handles (joints +
-    // locks). A joint can be locked at most once (enforced by mutable borrow),
-    // so this can be at most 4. The exception to this rule is that, when a drop
-    // reduces the count to 1, that drops the value, then *immediately* attempts
-    // to decrement the count down to 0. Summary of states:
+    // locks). The exception to this rule is that, when a drop reduces the
+    // count to 1, that drops the value, then *immediately* attempts to
+    // decremement the count down to 0. Summary of states:
     //
     // - 0: When we observe a 0, it means that this is the last Joint in
     //   existence and that the value was previously dropped. New lock attempts
@@ -53,19 +121,17 @@ struct JointContainer<T> {
     //   last joint will take care of dropping the container, otherwise, we need
     //   to drop the container ourselves, because the last joint dropped while
     //   we were dropping the value
-    // - 2: either both joints exist, or a joint exists and was locked when the
-    //   other joint dropped. Either way, value is alive and well, but will be
-    //   dropped when the joint or lock is dropped.
-    // - 3: both joins exist and one of them is locked. Nothing interesting is
-    //   hapenning here.
-    // - 4: both joins exist and both are locked.
-    count: AtomicU8,
+    // - 2+: either both joints exist, or a joint exists and is locked. In
+    //   either case, the value is alive, and becomes dead when the count drops
+    //   to 1
+    count: AtomicU32,
 }
 
 impl<T> JointContainer<T> {
     /// Drop the stored value. This method should only be called when only one
     /// joint exists, and it's unlocked. You must ensure that the value is
     /// never accessed after this method is called.
+    #[inline]
     pub unsafe fn drop_value_in_place(&self) {
         self.value
             .get()
@@ -76,6 +142,8 @@ impl<T> JointContainer<T> {
 
     /// Assume that the value hasn't been dropped yet and get a reference to it.
     /// You must not call this if the value has been dropped in place.
+    #[inline]
+    #[must_use]
     pub unsafe fn get_value(&self) -> &T {
         self.value
             .get()
@@ -85,7 +153,6 @@ impl<T> JointContainer<T> {
     }
 }
 
-#[repr(transparent)]
 pub struct Joint<T> {
     container: NonNull<JointContainer<T>>,
     phantom: PhantomData<JointContainer<T>>,
@@ -108,13 +175,13 @@ impl<T> Joint<T> {
 
     /// Create a new pair of `Joint`s, which share ownership of a value. When
     /// *either* of these joints is dropped, the shared value will be dropped
-    /// immediately.
+    /// immediately. See the [module docs][]
     #[must_use]
     #[inline]
     pub fn new(value: T) -> (Self, Self) {
         let container = Box::new(JointContainer {
             value: UnsafeCell::new(MaybeUninit::new(value)),
-            count: AtomicU8::new(2),
+            count: AtomicU32::new(2),
         });
 
         let container = NonNull::new(Box::into_raw(container)).expect("box is definitely non null");
@@ -135,12 +202,10 @@ impl<T> Joint<T> {
     /// both joints still exist. The value is guaranteed to exist as long as the
     /// lock exists, even if the other `Joint` is dropped.
     #[must_use]
-    pub fn lock(&mut self) -> Option<JointLock<'_, T>> {
-        // Increasing the reference count can always be done with Relaxed– New
-        // references to an object can only be formed from an existing
-        // reference, and passing an existing reference from one thread to
-        // another must already provide any required synchronization.
-        let mut current = self.container().count.load(Ordering::Relaxed);
+    pub fn lock(&self) -> Option<JointLock<'_, T>> {
+        let count = &self.container().count;
+
+        let mut current = count.load(Ordering::Relaxed);
 
         loop {
             // We can only lock this if *both* handles currently exist. TODO:
@@ -154,9 +219,21 @@ impl<T> Joint<T> {
                 // dropped), so we can no longer create new locks.
                 0 | 1 => break None,
 
-                // Normal state: both `Joints` exist, and the other one may or
-                // may not be locked. Increment the count.
-                n @ (2 | 3) => match self.container().count.compare_exchange_weak(
+                // There are too many locks already, probably because they're
+                // being leaked.
+                //
+                // We abort here because, to quote `Arc` (which does the same
+                // thing): "this is such a degenerate scenario that we don't
+                // care about what happens -- no real program should ever
+                // experience this."
+                n if n > MAX_COUNT => abort(),
+
+                // Increasing the reference count can always be done with Relaxed– New
+                // references to an object can only be formed from an existing
+                // reference, and passing an existing reference from one thread to
+                // another must already provide any required synchronization.
+                // n >= 2, so the object is alive.
+                n => match count.compare_exchange_weak(
                     n,
                     n + 1,
                     Ordering::Relaxed,
@@ -165,31 +242,25 @@ impl<T> Joint<T> {
                     Ok(_) => {
                         break Some(JointLock {
                             container: self.container(),
-                            lifetime: PhantomData,
                         })
                     }
                     Err(n) => n,
                 },
-
-                // Semi-broken state: the only way we can observe a 4 here is
-                // if other locks were leaked. There's nothing really bad that
-                // can happen here outside of promulgating the leak, so we just
-                // keep the 4 (since, in the worst case, it was our own sibling
-                // that leaked, so there could now once again be 2 locks in
-                // existence)
-                4 => {
-                    break Some(JointLock {
-                        container: self.container(),
-                        lifetime: PhantomData,
-                    })
-                }
-
-                // It shouldn't ever be possible to observe a larger number
-                // than 4, because here in `lock` is the only place increments
-                // ever happen.
-                n => unsafe { debug_unreachable!("Joint count was {n}") },
             }
         }
+    }
+
+    /// Check to see if the underlying object is alive. This requires either
+    /// that the other [`Joint`] still exists or that this one is currently
+    /// locked.
+    ///
+    /// Note that another thread can cause this to become false at any time.
+    /// However, once this returns false, it will never return true for this
+    /// specific [`Joint`] instance.
+    #[inline]
+    #[must_use]
+    pub fn alive(&self) -> bool {
+        self.container().count.load(Ordering::Relaxed) >= 2
     }
 }
 
@@ -198,8 +269,8 @@ impl<T: Debug> Debug for Joint<T> {
         match self.container().count.load(Ordering::Relaxed) {
             0 | 1 => write!(f, "Joint(<unpaired>)"),
 
-            // Joints can only be locked if they're mutably borrowed, so we know
-            // that we're not locked.
+            // Technically it could be unpaired but still have live locks.
+            // We're not really worried about that case.
             _ => write!(f, "Joint(<paired>)"),
         }
     }
@@ -306,33 +377,25 @@ impl<T> Drop for Joint<T> {
                         }
                     }
 
-                    // The other joint is currently locked, so we don't have to
-                    // do anything. The other joint's lock will take care of
-                    // dropping the data.
-                    Ok(3) => return,
-
-                    // Semi-broken state; being here means that a lock leaked at
-                    // some point. We can attempt some repair here: we know
-                    // that, in the worst case, the other Joint exists and has
-                    // at most one lock, so we can set the count to 2. We do
-                    // this by' claiming that the compare-exchange failed and
-                    // the current count is 3 (which means it'll decrement to
-                    // 2).
-                    Ok(4) => 3,
-
-                    // It isn't possible for the count to be > 4, because the
-                    // only place it ever increments doesn't increase it past 4.
-                    Ok(n) => unsafe { debug_unreachable!("Joint count was {n}") },
+                    // The other joint exists and is locked, which means it
+                    // will take care of dropping the value.
+                    Ok(_) => return,
                 },
             }
         }
     }
 }
 
-#[repr(transparent)]
 pub struct JointLock<'a, T> {
     container: &'a JointContainer<T>,
-    lifetime: PhantomData<&'a mut Joint<T>>,
+}
+
+impl<T> JointLock<'_, T> {
+    // It's convenient for various reasons to store a reference in the
+    // `JointLock` itself and only get a raw pointer if we really need one.
+    fn pointer_to_container(&self) -> NonNull<JointContainer<T>> {
+        NonNull::from(self.container)
+    }
 }
 
 // Theoretically we could *not* add `Send` or `Sync` to the lock type; this
@@ -361,6 +424,32 @@ impl<T: Debug> Debug for JointLock<'_, T> {
     }
 }
 
+impl<T> Clone for JointLock<'_, T> {
+    fn clone(&self) -> Self {
+        // The logic for cloning a joint lock can be a bit simpler than for
+        // locking a joint, because we're guaranteed that the value is alive
+        // (because this lock exists presently)
+        //
+        // Much like with lock, we can do a relaxed increment. See Joint::lock
+        // for details.
+        let old_count = self.container.count.fetch_add(1, Ordering::Relaxed);
+
+        if old_count > MAX_COUNT {
+            abort()
+        }
+
+        JointLock {
+            container: self.container,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        if self.pointer_to_container() != source.pointer_to_container() {
+            *self = source.clone()
+        }
+    }
+}
+
 impl<T> Drop for JointLock<'_, T> {
     fn drop(&mut self) {
         let count = &self.container.count;
@@ -383,9 +472,9 @@ impl<T> Drop for JointLock<'_, T> {
             },
 
             // If the count was 2, it means that the other joint dropped while
-            // this lock existed. We've already stored the decrement, which
-            // means we've taken responsibility for attempting to drop (and that
-            // future attempts to lock will now fail)
+            // this lock existed. We've already stored the 1, which means we've
+            // taken responsibility for attempting to drop (and that future
+            // attempts to lock will now fail)
             2 => {
                 unsafe { self.container.drop_value_in_place() }
 
@@ -399,13 +488,9 @@ impl<T> Drop for JointLock<'_, T> {
                 count.store(0, Ordering::Release)
             }
 
-            // If the count is higher than two, the value is still alive
+            // If the count was higher than two, the value is still alive even
+            // after this lock drops
             _ => {}
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    extern crate std;
 }
