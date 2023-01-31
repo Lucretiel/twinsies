@@ -269,7 +269,7 @@ impl<T> Joint<T> {
     }
 }
 
-impl<T: Debug> Debug for Joint<T> {
+impl<T> Debug for Joint<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.container().count.load(Ordering::Relaxed) {
             0 | 1 => write!(f, "Joint(<unpaired>)"),
@@ -322,6 +322,10 @@ impl<T> Drop for Joint<T> {
                     // compare-exchange sites) because we always need to ensure
                     // that n - 1 was stored.
                     Err(n) => n,
+
+                    // Can't possibly have replaced a 0; we check for that case
+                    // before attempting the compare-exchange.
+                    Ok(0) => unsafe { debug_unreachable!() },
 
                     // The other joint is in the middle of dropping the value.
                     // We stored a 0, so it will also take care of dropping the
