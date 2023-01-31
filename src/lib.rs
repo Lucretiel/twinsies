@@ -352,8 +352,6 @@ impl<T> Drop for Joint<T> {
                             match count.compare_exchange_weak(
                                 1,
                                 0,
-                                // Don't need to acquire in this case because we
-                                // also did the drop ourselves.
                                 Ordering::Release,
                                 Ordering::Relaxed,
                             ) {
