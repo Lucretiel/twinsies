@@ -56,8 +56,8 @@ assert_eq!(lock.get(), 20);
 lock.set(30);
 assert_eq!(lock.get(), 30);
 
-// As soon as the lock is dropped, the shared value is gone, since `second`
-// was dropped earlier
+// As soon as the lock is dropped, the shared value is gone, since `second` was
+// dropped earlier
 drop(lock);
 assert!(first.lock().is_none());
 ```
@@ -79,7 +79,10 @@ use std::{
     ops::Deref,
     process::abort,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{
+        AtomicU32,
+        Ordering::{AcqRel, Acquire, Relaxed, Release},
+    },
 };
 
 use alloc::boxed::Box;
@@ -129,8 +132,8 @@ struct JointContainer<T> {
 
 impl<T> JointContainer<T> {
     /// Drop the stored value. This method should only be called when only one
-    /// joint exists, and it's unlocked. You must ensure that the value is
-    /// never accessed after this method is called.
+    /// joint exists, and it's unlocked. You must ensure that the value is never
+    /// accessed after this method is called.
     #[inline]
     pub unsafe fn drop_value_in_place(&self) {
         self.value
@@ -153,8 +156,9 @@ impl<T> JointContainer<T> {
     }
 }
 
-/// A thread-safe shared ownership type that shares ownership with a partner, such
-/// that the shared object is dropped when *either* [`Joint`] goes out of scope.
+/// A thread-safe shared ownership type that shares ownership with a partner,
+/// such that the shared object is dropped when *either* [`Joint`] goes out of
+/// scope.
 ///
 /// See [module docs][crate] for details.
 pub struct Joint<T> {
@@ -210,7 +214,7 @@ impl<T> Joint<T> {
     pub fn lock(&self) -> Option<JointLock<'_, T>> {
         let count = &self.container().count;
 
-        let mut current = count.load(Ordering::Relaxed);
+        let mut current = count.load(Relaxed);
 
         loop {
             // We can only lock this if *both* handles currently exist. TODO:
@@ -233,17 +237,12 @@ impl<T> Joint<T> {
                 // experience this."
                 n if n > MAX_COUNT => abort(),
 
-                // Increasing the reference count can always be done with Relaxed– New
-                // references to an object can only be formed from an existing
-                // reference, and passing an existing reference from one thread to
-                // another must already provide any required synchronization.
-                // n >= 2, so the object is alive.
-                n => match count.compare_exchange_weak(
-                    n,
-                    n + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
+                // Increasing the reference count can always be done with
+                // Relaxed– New references to an object can only be formed from
+                // an existing reference, and passing an existing reference from
+                // one thread to another must already provide any required
+                // synchronization. n >= 2, so the object is alive.
+                n => match count.compare_exchange_weak(n, n + 1, Relaxed, Relaxed) {
                     Ok(_) => {
                         break Some(JointLock {
                             container: self.container(),
@@ -265,17 +264,17 @@ impl<T> Joint<T> {
     #[inline]
     #[must_use]
     pub fn alive(&self) -> bool {
-        self.container().count.load(Ordering::Relaxed) >= 2
+        self.container().count.load(Relaxed) >= 2
     }
 }
 
 impl<T> Debug for Joint<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.container().count.load(Ordering::Relaxed) {
+        match self.container().count.load(Relaxed) {
             0 | 1 => write!(f, "Joint(<unpaired>)"),
 
-            // Technically it could be unpaired but still have live locks.
-            // We're not really worried about that case.
+            // Technically it could be unpaired but still have live locks. We're
+            // not really worried about that case.
             _ => write!(f, "Joint(<paired>)"),
         }
     }
@@ -291,7 +290,7 @@ impl<T> Drop for Joint<T> {
     fn drop(&mut self) {
         let count = &self.container().count;
 
-        let mut current = count.load(Ordering::Acquire);
+        let mut current = count.load(Acquire);
 
         // Note that all of the failures in the compare-exchanges here are
         // Acquire ordering, even on failure, because failures could indicate
@@ -311,12 +310,7 @@ impl<T> Drop for Joint<T> {
                     return;
                 }
 
-                n => match count.compare_exchange_weak(
-                    n,
-                    n - 1,
-                    Ordering::Acquire,
-                    Ordering::Acquire,
-                ) {
+                n => match count.compare_exchange_weak(n, n - 1, Acquire, Acquire) {
                     // All failures, spurious or otherwise, need to be retried.
                     // There's no "fast escape" case (like there are in other
                     // compare-exchange sites) because we always need to ensure
@@ -348,50 +342,47 @@ impl<T> Drop for Joint<T> {
                         // to acquire. If we find there's already a zero, the
                         // other joint dropped while we were dropping value, so
                         // we also handle dropping the container.
-                        loop {
-                            match count.compare_exchange_weak(
-                                1,
-                                0,
-                                Ordering::Release,
-                                Ordering::Relaxed,
-                            ) {
-                                // We stored a zero; the other Joint will be
-                                // responsible for deallocating the container
-                                Ok(_) => return,
 
-                                // There was already a 0; the other joint
-                                // dropped while we were dropping the value.
-                                // Deallocate.
-                                //
-                                // There's no risk of another thread loading
-                                // this same 0, because we know the only other
-                                // reference in existence is the other Joint. we
-                                // stored a 1, so it can never create more
-                                // locks; either it will store a 0 (detected
-                                // here) or we'll store a 0 that it will load.
-                                Err(0) => {
-                                    drop(unsafe { Box::from_raw(self.container.as_ptr()) });
-                                    return;
-                                }
+                        match count.compare_exchange(1, 0, Release, Relaxed) {
+                            // We stored a zero; the other Joint will be
+                            // responsible for deallocating the container
+                            Ok(_) => return,
 
-                                // Spurious failure; retry
-                                Err(1) => continue,
-
-                                // It's never possible for the count to
-                                // transition from 1 to any value other than 0
-                                // or 1.
-                                Err(n) => unsafe {
-                                    debug_unreachable!(
-                                        "Joint count became {n} \
-                                        after it previously stored 1"
-                                    )
-                                },
+                            // There was already a 0; the other joint dropped
+                            // while we were dropping the value. Deallocate.
+                            //
+                            // There's no risk of another thread loading this
+                            // same 0, because we know the only other reference
+                            // in existence is the other Joint. we stored a 1,
+                            // so it can never create more locks; either it will
+                            // store a 0 (detected here) or we'll store a 0 that
+                            // it will load.
+                            Err(0) => {
+                                drop(unsafe { Box::from_raw(self.container.as_ptr()) });
+                                return;
                             }
+
+                            // Spurious failure
+                            Err(1) => unsafe {
+                                debug_unreachable!(
+                                    "Spurious failure shouldn't happen \
+                                    on compare_exchange"
+                                )
+                            },
+
+                            // It's never possible for the count to transition
+                            // from 1 to any value other than 0 or 1.
+                            Err(n) => unsafe {
+                                debug_unreachable!(
+                                    "Joint count became {n} \
+                                        after it previously stored 1"
+                                )
+                            },
                         }
                     }
 
-                    // The other joint exists and is locked, which means it
-                    // will take care of dropping the value.
+                    // The other joint exists and is locked, which means it will
+                    // take care of dropping the value.
                     Ok(_) => return,
                 },
             }
@@ -437,8 +428,8 @@ impl<T> Deref for JointLock<'_, T> {
     #[inline]
     #[must_use]
     fn deref(&self) -> &Self::Target {
-        // Safety: if a JointLock exists, it's guaranteed that the value will
-        // be alive for at least the duration of the lock
+        // Safety: if a JointLock exists, it's guaranteed that the value will be
+        // alive for at least the duration of the lock
         unsafe { self.container.get_value() }
     }
 }
@@ -465,7 +456,7 @@ impl<T> Clone for JointLock<'_, T> {
         //
         // Much like with lock, we can do a relaxed increment. See Joint::lock
         // for details.
-        let old_count = self.container.count.fetch_add(1, Ordering::Relaxed);
+        let old_count = self.container.count.fetch_add(1, Relaxed);
 
         if old_count > MAX_COUNT {
             abort()
@@ -495,7 +486,7 @@ impl<T> Drop for JointLock<'_, T> {
         // - Need to acquire any changes made by other threads before dropping
         // - Need to release any changes made by *this* thread so that it can be
         //   dropped by another thread.
-        match count.fetch_sub(1, Ordering::AcqRel) {
+        match count.fetch_sub(1, AcqRel) {
             // The count must be at LEAST 2, before the subtract: one for us and
             // one for our parent
             n @ (0 | 1) => unsafe {
@@ -517,9 +508,11 @@ impl<T> Drop for JointLock<'_, T> {
                 // need at this point to compare-exchange, since we're
                 // guaranteed that the other joint is gone and that our parent
                 // joint won't drop before we're done dropping ourselves.
-                // We release-store the 0 so that the drop-in-place is visible
-                // to our parent.
-                count.store(0, Ordering::Release)
+                // Ordinarily we'd need to release-store the 0, but lifetime
+                // rules guarantee that the parent drop can't start until after
+                // this drop finishes, with all the synchronization that
+                // implies.
+                count.store(0, Release)
             }
 
             // If the count was higher than two, the value is still alive even
