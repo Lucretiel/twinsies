@@ -530,3 +530,52 @@ impl<T> Drop for JointLock<'_, T> {
 }
 
 impl<T> Unpin for JointLock<'_, T> {}
+
+#[cfg(test)]
+mod tests {
+    use std::{hint::black_box, sync, thread};
+
+    use crate::Joint;
+
+    #[test]
+    fn drop_test() {
+        struct Container(sync::Mutex<Vec<i32>>);
+
+        impl Drop for Container {
+            fn drop(&mut self) {
+                let data = self.0.get_mut().unwrap_or_else(|err| err.into_inner());
+                let data = black_box(data);
+                data.push(5);
+                println!("{data:?}");
+            }
+        }
+
+        for i in 0..100 {
+            let barrier = sync::Barrier::new(2);
+            let barrier = &barrier;
+
+            let (joint1, joint2) = Joint::new(Container(sync::Mutex::new(Vec::new())));
+
+            thread::scope(move |s| {
+                let thread1 = s.spawn(move || {
+                    barrier.wait();
+
+                    if let Some(lock) = joint1.lock() {
+                        lock.0.lock().unwrap_or_else(|e| e.into_inner()).push(i * 2);
+                    }
+                });
+
+                let thread2 = s.spawn(move || {
+                    barrier.wait();
+
+                    if let Some(lock) = joint2.lock() {
+                        lock.0.lock().unwrap_or_else(|e| e.into_inner()).push(i * 3);
+                    }
+                });
+
+                thread1.join().unwrap();
+                thread2.join().unwrap();
+            })
+        }
+    }
+}
