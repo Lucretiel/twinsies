@@ -346,7 +346,7 @@ impl<T> Drop for Joint<T> {
                         match count.compare_exchange(1, 0, Release, Relaxed) {
                             // We stored a zero; the other Joint will be
                             // responsible for deallocating the container
-                            Ok(_) => return,
+                            Ok(_) => {}
 
                             // There was already a 0; the other joint dropped
                             // while we were dropping the value. Deallocate.
@@ -357,12 +357,9 @@ impl<T> Drop for Joint<T> {
                             // so it can never create more locks; either it will
                             // store a 0 (detected here) or we'll store a 0 that
                             // it will load.
-                            Err(0) => {
-                                drop(unsafe { Box::from_raw(self.container.as_ptr()) });
-                                return;
-                            }
+                            Err(0) => drop(unsafe { Box::from_raw(self.container.as_ptr()) }),
 
-                            // Spurious failure
+                            // Spurious failure shouldn't happen
                             Err(1) => unsafe {
                                 debug_unreachable!(
                                     "Spurious failure shouldn't happen \
@@ -379,6 +376,8 @@ impl<T> Drop for Joint<T> {
                                 )
                             },
                         }
+
+                        return;
                     }
 
                     // The other joint exists and is locked, which means it will
