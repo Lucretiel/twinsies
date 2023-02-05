@@ -289,17 +289,34 @@ impl<T> fmt::Pointer for Joint<T> {
 
 impl<T> Drop for Joint<T> {
     fn drop(&mut self) {
-        let count = &self.container().count;
+        let mut current = self.container().count.load(Ordering::Acquire);
 
-        let mut current = count.load(Ordering::Acquire);
+        /*
+        Author note: there's something I'm not understanding about some of the
+        atomic orderings here. As near as I can tell from my own analysis:
 
-        // Note that all of the failures in the compare-exchanges here are
-        // Acquire ordering, even on failure, because failures could indicate
-        // that the other handle dropped, meaning that we need to acquire its
-        // changes before we start dropping or deallocating anything.
-        // Additionally, note that we *usually* don't need to release anything
-        // here, because `Joint` isn't itself capable of writing to `value`
-        // (only JointLock can do that, and it *does* release on drop.)
+        - It should be sufficient that the first compare-exchange here is
+          acquire/acquire (because joints themselves can't do any interesting
+          writes with the shared value, and JointLocks *do* release write the
+          reference count)
+        - It should be sufficient that the second compare-exchange here is
+          release/relaxed, because *this* thread is doing the drop with exclusive
+          access, which means it can't possibly acquire any additional
+          interesting writes from other joints
+
+        However, miri complains if I downgrade the orderings past this point.
+        For now I'm going to just add speculation to this comment block until
+        I can pin down for sure what's going on.
+
+        - I think a Release write might be necessary in the *first*
+          compare-exchange because otherwise the acquire might not work. The
+          basic question is about this flow:
+          release-store 2 (the joint lock)
+          relaxed-store 1 (the joint itself)
+
+          if we acquire-load the 1, does that acquire changes released by the 2?
+          if not, then the store of the 1 needs to be release.
+        */
         loop {
             current = match current {
                 // The value has been fully dropped, this is the last remaining
@@ -311,10 +328,10 @@ impl<T> Drop for Joint<T> {
                     return;
                 }
 
-                n => match count.compare_exchange_weak(
+                n => match self.container().count.compare_exchange_weak(
                     n,
                     n - 1,
-                    Ordering::Acquire,
+                    Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
                     // All failures, spurious or otherwise, need to be retried.
@@ -348,45 +365,53 @@ impl<T> Drop for Joint<T> {
                         // to acquire. If we find there's already a zero, the
                         // other joint dropped while we were dropping value, so
                         // we also handle dropping the container.
-                        loop {
-                            match count.compare_exchange_weak(
-                                1,
-                                0,
-                                Ordering::Release,
-                                Ordering::Relaxed,
-                            ) {
-                                // We stored a zero; the other Joint will be
-                                // responsible for deallocating the container
-                                Ok(_) => return,
 
-                                // There was already a 0; the other joint
-                                // dropped while we were dropping the value.
-                                // Deallocate.
-                                //
-                                // There's no risk of another thread loading
-                                // this same 0, because we know the only other
-                                // reference in existence is the other Joint. we
-                                // stored a 1, so it can never create more
-                                // locks; either it will store a 0 (detected
-                                // here) or we'll store a 0 that it will load.
-                                Err(0) => {
-                                    drop(unsafe { Box::from_raw(self.container.as_ptr()) });
-                                    return;
-                                }
+                        match self.container().count.compare_exchange(
+                            1,
+                            0,
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        ) {
+                            // We stored a zero; the other Joint will be
+                            // responsible for deallocating the container
+                            Ok(_) => return,
 
-                                // Spurious failure; retry
-                                Err(1) => continue,
-
-                                // It's never possible for the count to
-                                // transition from 1 to any value other than 0
-                                // or 1.
-                                Err(n) => unsafe {
-                                    debug_unreachable!(
-                                        "Joint count became {n} \
-                                        after it previously stored 1"
-                                    )
-                                },
+                            // There was already a 0; the other joint
+                            // dropped while we were dropping the value.
+                            // Deallocate.
+                            //
+                            // We apparently need to acquire-load this 0 and to
+                            // be honest I have no idea why. The only way we're
+                            // at this point is if this thread, moments ago,
+                            // called drop_value_in_place, so what other changes
+                            // could we possibly need to acquire from other
+                            // threads? I guess maybe we need to acquire that
+                            // the other joint is entirely done dropping itself
+                            // so that the box drop here doesn't occur while
+                            // the other joint's reference to `count` still
+                            // exists?
+                            Err(0) => {
+                                drop(unsafe { Box::from_raw(self.container.as_ptr()) });
+                                return;
                             }
+
+                            // Spurious failure
+                            Err(1) => unsafe {
+                                debug_unreachable!(
+                                    "Spurious failure in compare_exchange \
+                                    should be impossible"
+                                )
+                            },
+
+                            // It's never possible for the count to
+                            // transition from 1 to any value other than 0
+                            // or 1.
+                            Err(n) => unsafe {
+                                debug_unreachable!(
+                                    "Joint count became {n} \
+                                        after it previously stored 1"
+                                )
+                            },
                         }
                     }
 
