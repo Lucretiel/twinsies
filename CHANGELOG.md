@@ -6,9 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## Unreleased
 
-### Internal
+### Added
 
-- Efficiency improvements to Joint::drop
+- Add a feature flag, `safest-memory-ordering`, which upgrades a few memory orderings to pass miri. It's a point of ongoing investigation to determine if those orderings are necessary, or if this is a false positive from miri. This feature is enabled by default.
 
 ## 1.1.0
 
