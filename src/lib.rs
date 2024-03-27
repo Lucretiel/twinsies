@@ -97,16 +97,6 @@ macro_rules! debug_unreachable {
     }
 }
 
-macro_rules! when {
-    ($cond:expr, $t:expr, $f:expr $(,)?) => {
-        if $cond {
-            $t
-        } else {
-            $f
-        }
-    };
-}
-
 const MAX_COUNT: u32 = i32::MAX as u32;
 
 struct JointContainer<T> {
@@ -320,12 +310,7 @@ impl<T> Drop for Joint<T> {
                     return;
                 }
 
-                n => match count.compare_exchange_weak(
-                    n,
-                    n - 1,
-                    when!(cfg!(feature = "safest-memory-ordering"), AcqRel, Acquire),
-                    Acquire,
-                ) {
+                n => match count.compare_exchange_weak(n, n - 1, AcqRel, Acquire) {
                     // All failures, spurious or otherwise, need to be retried.
                     // There's no "fast escape" case (like there are in other
                     // compare-exchange sites) because we always need to ensure
@@ -358,12 +343,7 @@ impl<T> Drop for Joint<T> {
                         // other joint dropped while we were dropping value, so
                         // we also handle dropping the container.
 
-                        match count.compare_exchange(
-                            1,
-                            0,
-                            Release,
-                            when!(cfg!(feature = "safest-memory-ordering"), Acquire, Relaxed),
-                        ) {
+                        match count.compare_exchange(1, 0, Release, Acquire) {
                             // We stored a zero; the other Joint will be
                             // responsible for deallocating the container
                             Ok(_) => {}

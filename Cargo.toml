@@ -1,6 +1,6 @@
 [package]
 name = "twinsies"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 authors = ["Nathan West <Lucretiel@gmail.com>"]
 
@@ -15,4 +15,6 @@ repository = "https://github.com/Lucretiel/twinsies"
 
 [features]
 default = ["safest-memory-ordering"]
+
+# Deprecated; this is now a no-op
 safest-memory-ordering = []
